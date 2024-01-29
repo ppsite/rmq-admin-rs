@@ -1,11 +1,16 @@
 use amqprs::{
-    channel::{BasicPublishArguments, QueueBindArguments, QueueDeclareArguments},
+    channel::{
+        BasicAckArguments, BasicConsumeArguments, BasicPublishArguments, Channel,
+        QueueBindArguments, QueueDeclareArguments,
+    },
     connection::{Connection, OpenConnectionArguments},
-    BasicProperties,
+    consumer::AsyncConsumer,
+    BasicProperties, Deliver,
 };
+use async_trait::async_trait;
 use clap::{Parser, ValueEnum};
 use log::info;
-use tokio::time;
+use tokio::{sync::Notify, time};
 
 #[derive(Parser, Debug, Clone, ValueEnum)]
 pub enum Action {
@@ -20,6 +25,47 @@ struct Args {
     // action
     #[arg(value_enum, short, long, default_value_t = Action::Publish)]
     action: Action,
+}
+
+pub struct MyConsumer {
+    no_ack: bool,
+}
+
+impl MyConsumer {
+    /// Return a new consumer.
+    ///
+    /// See [Acknowledgement Modes](https://www.rabbitmq.com/consumers.html#acknowledgement-modes)
+    ///
+    /// no_ack = [`true`] means automatic ack and should NOT send ACK to server.
+    ///
+    /// no_ack = [`false`] means manual ack, and should send ACK message to server.
+    pub fn new(no_ack: bool) -> Self {
+        Self { no_ack }
+    }
+}
+
+#[async_trait]
+impl AsyncConsumer for MyConsumer {
+    async fn consume(
+        &mut self,
+        channel: &Channel,
+        deliver: Deliver,
+        _basic_properties: BasicProperties,
+        content: Vec<u8>,
+    ) {
+        info!(
+            "consume from delivery {} on channel {}, content: {:?}",
+            deliver,
+            channel,
+            String::from_utf8_lossy(&content)
+        );
+        // ack explicitly if manual ack
+        if !self.no_ack {
+            info!("ack to delivery {} on channel {}", deliver, channel);
+            let args = BasicAckArguments::new(deliver.delivery_tag(), false);
+            channel.basic_ack(args).await.unwrap();
+        }
+    }
 }
 
 // define structs with fields: host, port, username, password, queue, routing_key, exchange_name
@@ -117,8 +163,49 @@ impl Rabbitmq {
         }
     }
 
-    pub fn consume(&self) {
+    pub async fn consume(&self) {
         info!("Start consuming message ...");
+
+        // define call back function
+        let consumer = MyConsumer::new(false);
+
+        // create connection
+        // open a connection to RabbitMQ server
+        let connection = Connection::open(&OpenConnectionArguments::new(
+            self.host.as_str(),
+            5672,
+            self.username.as_str(),
+            self.password.as_str(),
+        ))
+        .await
+        .unwrap();
+        // create channel
+        let channel = connection.open_channel(None).await.unwrap();
+        // declare a queue
+        let (queue_name, _, _) = channel
+            .queue_declare(QueueDeclareArguments::new(self.queue.as_str()))
+            .await
+            .unwrap()
+            .unwrap();
+        // bind the queue to exchange
+        channel
+            .queue_bind(QueueBindArguments::new(
+                &queue_name,
+                self.exchange_name.as_str(),
+                self.routing_key.as_str(),
+            ))
+            .await
+            .unwrap();
+
+        // consume message
+        let args = BasicConsumeArguments::new(&queue_name, "example_basic_pub_sub");
+
+        channel.basic_consume(consumer, args).await.unwrap();
+
+        // consume forever
+        println!("consume forever..., ctrl+c to exit");
+        let guard = Notify::new();
+        guard.notified().await;
     }
 }
 
@@ -134,6 +221,6 @@ async fn main() {
     let rabbitmq = Rabbitmq::default();
     match args.action {
         Action::Publish => rabbitmq.publish().await,
-        Action::Consume => rabbitmq.consume(),
+        Action::Consume => rabbitmq.consume().await,
     }
 }
