@@ -1,0 +1,5 @@
+{
+    "rust-analyzer.linkedProjects": [
+        "./rmq-admin-sdk/Cargo.toml"
+    ]
+}
